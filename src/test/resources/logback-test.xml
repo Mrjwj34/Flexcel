@@ -1,0 +1,35 @@
+<configuration>
+
+    <!-- 1. 定义日志输出器 (Appender)，这里是输出到控制台 -->
+    <appender name="STDOUT" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder>
+            <!-- 定义日志格式 -->
+            <pattern>%d{HH:mm:ss.SSS} [%thread] %-5level %logger{36} - %msg%n</pattern>
+        </encoder>
+    </appender>
+
+    <!-- 2. 【核心】为你的库设置特定的日志级别 -->
+    <!-- 将你库的根包路径放在这里。假设你的库的根包是 com.github.jwj.flexcel -->
+    <!--
+        level="INFO":  只输出 INFO, WARN, ERROR 级别的日志。
+                       这是生产环境或性能测试时的推荐配置。
+                       DEBUG 日志将被忽略，极大提升性能。
+    -->
+    <logger name="com.github.jwj.flexcel" level="DEBUG" additivity="false">
+        <appender-ref ref="STDOUT" />
+    </logger>
+
+    <!--
+        如果你想在开发时看到详细的调试信息，可以临时改成 DEBUG
+        <logger name="com.github.jwj.flexcel" level="DEBUG" additivity="false">
+            <appender-ref ref="STDOUT" />
+        </logger>
+    -->
+
+    <!-- 3. 为其他所有的库（包括Spring、Hibernate等）设置一个通用的日志级别 -->
+    <!-- 这就是所谓的“根日志记录器” -->
+    <root level="WARN">
+        <appender-ref ref="STDOUT" />
+    </root>
+
+</configuration>
