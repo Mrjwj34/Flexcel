@@ -1,7 +1,7 @@
 
 ---
 
-# Flexcel - 在30s内导出千万单元格的模板引擎
+# Flexcel
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
