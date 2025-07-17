@@ -76,7 +76,7 @@ public class FullFeatureTest {
     void setup() {
         this.engine = PoiTemplateEngine.builder()
                 .queueCapacity(1024)
-                .registerService("dateUtil", new DateUtil())
+                .registerService(DateUtil.class, "dateUtil")
                 .build();
     }
 

@@ -341,7 +341,7 @@ public class NewTest {
     void standardFeaturesTest() throws Exception {
         // 使用默认配置构建引擎
         ExcelTemplateEngine engine = PoiTemplateEngine.builder()
-                .registerService("dateUtil", new DateUtil())
+                .registerService(DateUtil.class, "dateUtil")
                 .build();
 //        engine.registerService();
 

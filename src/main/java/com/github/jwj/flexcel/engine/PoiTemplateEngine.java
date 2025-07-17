@@ -4,7 +4,7 @@
  * Copyright © 2025 jwj
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
- * associated documentation files (the “Software”), to deal in the Software without restriction, including
+ * associated documentation files (the "Software"), to deal in the Software without restriction, including
  *  without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
  *  copies of the Software, and to permit persons to whom the Software is furnished to do so, subject
  *  to the following conditions:
@@ -12,7 +12,7 @@
  * The above copyright notice and this permission notice shall be included in all copies or substantial
  * portions of the Software.
  *
- * THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
  * INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
  * PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
  * COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN
@@ -53,10 +53,6 @@ import org.apache.poi.xssf.streaming.SXSSFSheet;
 import org.apache.poi.xssf.streaming.SXSSFWorkbook;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.context.expression.MapAccessor;
-import org.springframework.expression.EvaluationContext;
-import org.springframework.expression.PropertyAccessor;
-import org.springframework.expression.spel.support.SimpleEvaluationContext;
 
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
@@ -65,7 +61,6 @@ import java.io.OutputStream;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.function.Function;
 
 /**
  * <p>
@@ -79,7 +74,7 @@ public class PoiTemplateEngine implements ExcelTemplateEngine {
     private final int sxssfWindowSize;
     private final int queueCapacity;
     private final Map<String, Object> services;
-    private Map<String, Object> globalContext;
+    private final Map<String, Object> globalContext;
     private final ExpressionEvaluator expressionEvaluator;
     private final ObjectPool objectPool;
     private final CellTemplateFactory cellTemplateFactory;
@@ -219,18 +214,74 @@ public class PoiTemplateEngine implements ExcelTemplateEngine {
             this.objectPool = objectPool;
             return this;
         }
+
         /**
-         * 注册服务。
-         * 服务可以在模板中通过表达式访问，类似于 Spring 的依赖注入。
+         * 注册一个服务类，引擎会根据配置智能决定注册实例还是类本身。
          *
-         * @param serviceName 服务名称，不能为空。
-         * @param service     服务实例，不能为空。
+         * <p><b>注册逻辑如下:</b></p>
+         * <ol>
+         *   <li>引擎首先尝试使用该类的公共无参构造函数创建一个<b>实例</b>。
+         *       <ul>
+         *          <li>如果成功，则注册该实例。这是最常见的用例，适用于普通服务类。
+         *              例如，注册 {@code MyService.class} 后，可通过 {@code ${myService.someMethod()}} 调用。</li>
+         *       </ul>
+         *   </li>
+         *   <li>如果实例化失败（例如，因为构造函数是私有的）:
+         *       <ul>
+         *          <li>如果已通过 {@link #enableUnsafeSpelOperations()} <b>启用了不安全模式</b>，
+         *              引擎会回退并注册该类的 {@code Class} 对象本身。这用于支持调用<b>静态方法</b>。
+         *              例如，注册 {@code MyUtils.class} 后，可通过 {@code ${myUtils.someStaticMethod()}} 调用。</li>
+         *          <li>如果在<b>安全模式</b>下实例化失败，引擎会抛出 {@link RuntimeException}，
+         *              因为在这种模式下，既无法创建实例，也无法调用静态方法，注册将无效。</li>
+         *       </ul>
+         *   </li>
+         * </ol>
+         *
+         * @param serviceClass 要注册的服务类。
+         * @param serviceName  可选的服务名称。如果未提供，将使用类名的首字母小写形式（例如, {@code MyService} -> {@code myService}）。
          * @return 当前 Builder 实例。
+         * @throws IllegalArgumentException 如果 serviceClass 为空。
+         * @throws RuntimeException 如果在安全模式下无法实例化该类。
          */
-        public Builder registerService(String serviceName, Object service) {
-            this.services.put(serviceName, service);
+        public Builder registerService(Class<?> serviceClass, String... serviceName) {
+            if (serviceClass == null) {
+                throw new IllegalArgumentException("Service class cannot be null.");
+            }
+
+            String name;
+            if (serviceName != null && serviceName.length > 0 && serviceName[0] != null && !serviceName[0].isEmpty()) {
+                name = serviceName[0];
+            } else {
+                String simpleName = serviceClass.getSimpleName();
+                name = Character.toLowerCase(simpleName.charAt(0)) + simpleName.substring(1);
+            }
+
+            try {
+                // 1. 优先尝试创建实例
+                Object serviceInstance = serviceClass.getDeclaredConstructor().newInstance();
+                this.services.put(name, serviceInstance);
+                logger.info("Registered service class '{}' as an instance with name '{}'", serviceClass.getName(), name);
+            } catch (Exception instantiationException) {
+                // 2. 实例化失败，根据安全模式开关决定下一步
+                if (this.unsafeSpelOperationsEnabled) {
+                    // 2a. 在不安全模式下，注册Class对象以调用静态方法
+                    this.services.put(name, serviceClass);
+                    logger.warn("Could not instantiate service class '{}'. As unsafe operations are enabled, " +
+                                    "registering the Class object itself for static method access under the name '{}'.",
+                            serviceClass.getName(), name);
+                } else {
+                    // 2b. 在安全模式下，无法创建实例也无法调用静态方法，因此这是一个错误
+                    throw new RuntimeException(
+                            "Failed to instantiate service class '" + serviceClass.getName() + "' in SAFE mode. " +
+                                    "Please ensure it has a public no-arg constructor, or enable unsafe operations " +
+                                    "via .enableUnsafeSpelOperations() to use it as a static utility class.",
+                            instantiationException
+                    );
+                }
+            }
             return this;
         }
+
         /**
          * 设置全局上下文。
          * 全局上下文中的变量可以在模板中通过表达式访问。
@@ -659,18 +710,5 @@ public class PoiTemplateEngine implements ExcelTemplateEngine {
                 logger.warn("Failed to add static merged region (might overlap with dynamic merges): {}", staticRegion.formatAsString());
             }
         }
-    }
-
-    @Override
-    public void registerService(String serviceName, Object service) {
-        if (this.services.containsKey(serviceName)) {
-            logger.warn("Service '{}' is already registered. Overwriting is not recommended after engine creation.", serviceName);
-        }
-        this.services.put(serviceName, service);
-    }
-
-    @Override
-    public void setContext(Map<String, Object> context) {
-        this.globalContext = context != null ? new HashMap<>(context) : new HashMap<>();
     }
 }
