@@ -12,6 +12,18 @@ import com.github.jwj.flexcel.parser.ast.template.DefaultCellTemplate;
 import com.github.jwj.flexcel.runtime.dto.RenderedCell;
 import org.apache.commons.compress.utils.IOUtils;
 import org.apache.poi.ss.usermodel.*;
+import org.apache.poi.ss.usermodel.charts.*;
+import org.apache.poi.ss.util.CellRangeAddress;
+import org.apache.poi.xddf.usermodel.chart.*;
+import org.apache.poi.xddf.usermodel.chart.AxisCrosses;
+import org.apache.poi.xddf.usermodel.chart.AxisPosition;
+import org.apache.poi.xddf.usermodel.chart.LegendPosition;
+import org.apache.poi.xssf.streaming.SXSSFDrawing;
+import org.apache.poi.xssf.streaming.SXSSFSheet;
+import org.apache.poi.xssf.usermodel.XSSFChart;
+import org.apache.poi.xssf.usermodel.XSSFClientAnchor;
+import org.apache.poi.xssf.usermodel.XSSFDrawing;
+import org.apache.poi.xssf.usermodel.XSSFSheet;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -22,6 +34,7 @@ import org.slf4j.LoggerFactory;
 import javax.imageio.ImageIO;
 import java.awt.image.BufferedImage;
 import java.io.*;
+import java.nio.file.Files;
 import java.text.SimpleDateFormat;
 import java.util.*;
 import java.util.function.Consumer;
@@ -47,6 +60,98 @@ public class NewTest {
     // ===================================================================================
     // == 自定义语法插件实现 (作为内部类，便于测试)
     // ===================================================================================
+    /**
+     * 【最终简化版 - XSSF 模式专用】自定义单元格语法处理器：#chartFromData
+     *
+     * 此版本假定引擎运行在标准的 XSSF 内存模式下，这是创建图表的必要条件。
+     */
+    public static class ChartFromDataHandler implements CellSyntaxHandler {
+        private static final String DIRECTIVE_PREFIX = "#chartFromData";
+        private static final Pattern ARGS_PATTERN = Pattern.compile("(\\w+)\\s*=\\s*'([^']+)'");
+
+        @Override
+        public boolean canHandle(String rawText) {
+            return rawText != null && rawText.trim().startsWith(DIRECTIVE_PREFIX);
+        }
+
+        @Override
+        public CellTemplate handle(CellParseContext context) {
+            Map<String, String> args = new HashMap<>();
+            Matcher matcher = ARGS_PATTERN.matcher(context.getRawStringValue());
+            while (matcher.find()) {
+                args.put(matcher.group(1), matcher.group(2));
+            }
+
+            return (templateContext, pool, stringCache, evaluator) -> {
+
+                Consumer<Cell> renderer = (cell) -> {
+                    if (!(cell.getSheet() instanceof XSSFSheet)) {
+                        cell.setCellValue("## CHARTING_REQUIRES_XSSF_SHEET ##");
+                        return;
+                    }
+                    XSSFSheet sheet = (XSSFSheet) cell.getSheet();
+
+                    // ... 省略参数和数据求值的代码，与之前版本相同 ...
+                    try {
+                        String title = (String) evaluator.evaluateString(args.get("title"), templateContext.getAllData());
+                        String seriesName = args.getOrDefault("series_name", "Series");
+                        Object categoryData = evaluator.evaluate(args.get("categories"), templateContext.getAllData());
+                        Object valueData = evaluator.evaluate(args.get("values"), templateContext.getAllData());
+                        if (!(categoryData instanceof Collection) || !(valueData instanceof Collection)) { /*...*/ return; }
+                        String[] categories = ((Collection<?>) categoryData).stream().map(String::valueOf).toArray(String[]::new);
+                        Number[] values = ((Collection<?>) valueData).stream().map(v -> (Number) v).toArray(Number[]::new);
+
+                        // 直接创建 XSSFDrawing，因为我们知道现在是 XSSFSheet
+                        XSSFDrawing drawing = sheet.createDrawingPatriarch();
+                        ClientAnchor anchor = createAnchor(drawing, cell, args.get("anchor"));
+                        XSSFChart chart = drawing.createChart(anchor);
+
+                        // 调用通用的构建逻辑
+                        buildChartContent(chart, title, seriesName, categories, values);
+
+                    } catch (Exception e) {
+                        testLogger.error("Failed to create chart in XSSF mode", e);
+                        cell.setCellValue("## CHART_CREATION_FAILED ##");
+                    }
+                };
+
+                RenderedCell renderedCell = pool.acquireCell();
+                renderedCell.setCustom(context.getTemplateAddress(), context.getColIndex(), renderer);
+                return renderedCell;
+            };
+        }
+
+        // createAnchor 和 buildChartContent 辅助方法与上一个版本完全相同，这里不再重复
+        private ClientAnchor createAnchor(org.apache.poi.ss.usermodel.Drawing<?> drawing, Cell cell, String anchorStr) {
+            if (anchorStr != null && !anchorStr.isEmpty()) {
+                CellRangeAddress range = CellRangeAddress.valueOf(anchorStr);
+                return drawing.createAnchor(0, 0, 0, 0,
+                        range.getFirstColumn(), range.getFirstRow(),
+                        range.getLastColumn() + 1, range.getLastRow() + 1);
+            } else {
+                return drawing.createAnchor(0, 0, 0, 0, cell.getColumnIndex(), cell.getRowIndex(), cell.getColumnIndex() + 8, cell.getRowIndex() + 15);
+            }
+        }
+
+        private void buildChartContent(XSSFChart chart, String title, String seriesName, String[] categories, Number[] values) {
+            chart.setTitleText(title);
+            chart.setTitleOverlay(false);
+            XDDFChartLegend legend = chart.getOrAddLegend();
+            legend.setPosition(LegendPosition.TOP_RIGHT);
+            XDDFCategoryAxis bottomAxis = chart.createCategoryAxis(AxisPosition.BOTTOM);
+            XDDFValueAxis leftAxis = chart.createValueAxis(AxisPosition.LEFT);
+            leftAxis.setCrosses(AxisCrosses.AUTO_ZERO);
+            XDDFDataSource<String> categoryDS = XDDFDataSourcesFactory.fromArray(categories);
+            XDDFNumericalDataSource<Number> valueDS = XDDFDataSourcesFactory.fromArray(values);
+            XDDFLineChartData data = (XDDFLineChartData) chart.createData(ChartTypes.LINE, bottomAxis, leftAxis);
+            XDDFLineChartData.Series series = (XDDFLineChartData.Series) data.addSeries(categoryDS, valueDS);
+            series.setTitle(seriesName, null);
+            series.setSmooth(true);
+            series.setMarkerStyle(MarkerStyle.CIRCLE);
+            chart.plot(data);
+        }
+    }
+
     /**
      * 【新增】自定义单元格语法处理器：#image
      * 语法: #image ${expression}
@@ -321,12 +426,12 @@ public class NewTest {
         data.put("emptyList", Collections.emptyList());
         data.put("nullList", null);
 
-        List<LargeItem> largeList = IntStream.range(0, 480)
+        List<LargeItem> largeList = IntStream.range(0, 500000)
                 .mapToObj(LargeItem::new)
                 .collect(Collectors.toList());
         data.put("largeList", largeList);
 
-        try (InputStream imageStream = new FileInputStream(new File(OUTPUT_DIR, "black.png"))) {
+        try (InputStream imageStream = Files.newInputStream(new File(OUTPUT_DIR, "black.png").toPath())) {
             data.put("logoImage", IOUtils.toByteArray(imageStream));
         } catch (IOException e) {
             testLogger.error("无法读取测试图片", e);
@@ -342,6 +447,10 @@ public class NewTest {
         // 使用默认配置构建引擎
         ExcelTemplateEngine engine = PoiTemplateEngine.builder()
                 .registerService(DateUtil.class, "dateUtil")
+                .queueCapacity(32)
+                .sxssfWindowSize(100)
+                .objectPoolCapacities(32, 256, 16)
+//                .disableStreaming()
                 .build();
 //        engine.registerService();
 
@@ -365,12 +474,14 @@ public class NewTest {
         // 1. 使用 Builder 模式构建一个高度自定义的引擎
         testLogger.info("构建一个配置了自定义语法插件的引擎...");
         ExcelTemplateEngine pluginEngine = PoiTemplateEngine.builder()
-                .sxssfWindowSize(50) // 自定义窗口大小
+//                .sxssfWindowSize(50) // 自定义窗口大小
                 .queueCapacity(512)   // 自定义队列容量
                 .disableObjectPooling() // 测试禁用对象池
+                .disableStreaming()
                 .registerCellSyntaxHandler(new QrCodeCellHandler())
                 .registerCellSyntaxHandler(new CommentCellHandler())// 注册自定义单元格插件
                 .registerCellSyntaxHandler(new ImageCellHandler())
+                .registerCellSyntaxHandler(new ChartFromDataHandler())
                 .registerBlockDirectiveHandler(new LogDirectiveHandler()) // 注册自定义块插件
                 .build();
 

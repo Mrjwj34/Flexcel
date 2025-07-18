@@ -22,6 +22,7 @@
 
 package com.github.jwj.flexcel.engine;
 
+import com.github.jwj.flexcel.engine.model.AnalyzedTemplate;
 import com.github.jwj.flexcel.plugin.cell.CellTemplateFactory;
 import com.github.jwj.flexcel.plugin.cell.CellSyntaxHandler;
 import com.github.jwj.flexcel.plugin.cell.DefaultCellHandler;
@@ -51,6 +52,7 @@ import org.apache.poi.ss.usermodel.*;
 import org.apache.poi.ss.util.CellRangeAddress;
 import org.apache.poi.xssf.streaming.SXSSFSheet;
 import org.apache.poi.xssf.streaming.SXSSFWorkbook;
+import org.apache.poi.xssf.usermodel.XSSFWorkbook;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -77,22 +79,22 @@ public class PoiTemplateEngine implements ExcelTemplateEngine {
     private final Map<String, Object> globalContext;
     private final ExpressionEvaluator expressionEvaluator;
     private final ObjectPool objectPool;
-    private final CellTemplateFactory cellTemplateFactory;
-    private final List<BlockDirectiveHandler> blockDirectiveHandlers;
+    private final FlexcelCompiler flexcelCompiler;
+    private final boolean streamingEnabled;
 
     public static Builder builder() {
         return new Builder();
     }
 
-    private PoiTemplateEngine(Builder builder) {
+    private PoiTemplateEngine(Builder builder, FlexcelCompiler flexcelCompiler) {
         this.sxssfWindowSize = builder.sxssfWindowSize;
         this.queueCapacity = builder.queueCapacity;
         this.services = new HashMap<>(builder.services);
         this.globalContext = new HashMap<>(builder.globalContext);
+        this.streamingEnabled = builder.streamingEnabled;
         this.expressionEvaluator = builder.expressionEvaluator;
         this.objectPool = builder.objectPool;
-        this.cellTemplateFactory = builder.cellTemplateFactory;
-        this.blockDirectiveHandlers = builder.blockDirectiveHandlers;
+        this.flexcelCompiler = flexcelCompiler;
 
         logger.info("PoiTemplateEngine created. CellHandlers: {}. BlockHandlers: {}",
                 builder.getRegisteredCellHandlerNames(),
@@ -102,6 +104,7 @@ public class PoiTemplateEngine implements ExcelTemplateEngine {
 
     public static class Builder {
         private int sxssfWindowSize = 1000;
+        private boolean streamingEnabled = true;
         private int queueCapacity = 2048;
         private final Map<String, Object> services = new HashMap<>();
         private final Map<String, Object> globalContext = new HashMap<>();
@@ -113,9 +116,6 @@ public class PoiTemplateEngine implements ExcelTemplateEngine {
         private int mergeableCellPoolCapacity = 1024;
         private ObjectPool objectPool;
 
-        private CellTemplateFactory cellTemplateFactory;
-        private List<BlockDirectiveHandler> blockDirectiveHandlers;
-
         private final List<CellSyntaxHandler> customCellSyntaxHandlers = new ArrayList<>();
         private final List<BlockDirectiveHandler> customBlockDirectiveHandlers = new ArrayList<>();
 
@@ -123,6 +123,18 @@ public class PoiTemplateEngine implements ExcelTemplateEngine {
         private final List<String> registeredBlockHandlerNames = new ArrayList<>();
 
         private Builder() {}
+
+
+        /**
+         * 【新增】禁用流式处理，强制使用 XSSFWorkbook。
+         * 这对于需要使用图表等高级功能的场景是必需的。
+         *
+         * @return 当前 Builder 实例。
+         */
+        public Builder disableStreaming() {
+            this.streamingEnabled = false;
+            return this;
+        }
 
         /**
          * 启用不安全的 SpEL 操作。
@@ -341,17 +353,17 @@ public class PoiTemplateEngine implements ExcelTemplateEngine {
             allCellHandlers.addAll(this.customCellSyntaxHandlers);
             allCellHandlers.add(new DefaultCellHandler());
             allCellHandlers.forEach(h -> this.registeredCellHandlerNames.add(h.getClass().getSimpleName()));
-            this.cellTemplateFactory = new CellTemplateFactory(allCellHandlers);
+            CellTemplateFactory cellTemplateFactory = new CellTemplateFactory(allCellHandlers);
 
-            this.blockDirectiveHandlers = new ArrayList<>();
-            this.blockDirectiveHandlers.addAll(this.customBlockDirectiveHandlers);
-            this.blockDirectiveHandlers.add(new ForEachDirectiveHandler());
-            this.blockDirectiveHandlers.add(new IfDirectiveHandler());
-            this.blockDirectiveHandlers.add(new ElseDirectiveHandler());
-            this.blockDirectiveHandlers.add(new EndDirectiveHandler());
-            this.blockDirectiveHandlers.forEach(h -> this.registeredBlockHandlerNames.add(h.getClass().getSimpleName()));
-
-            return new PoiTemplateEngine(this);
+            List<BlockDirectiveHandler> blockDirectiveHandlers = new ArrayList<>();
+            blockDirectiveHandlers.addAll(this.customBlockDirectiveHandlers);
+            blockDirectiveHandlers.add(new ForEachDirectiveHandler());
+            blockDirectiveHandlers.add(new IfDirectiveHandler());
+            blockDirectiveHandlers.add(new ElseDirectiveHandler());
+            blockDirectiveHandlers.add(new EndDirectiveHandler());
+            blockDirectiveHandlers.forEach(h -> this.registeredBlockHandlerNames.add(h.getClass().getSimpleName()));
+            FlexcelCompiler compiler = new FlexcelCompiler(cellTemplateFactory, blockDirectiveHandlers);
+            return new PoiTemplateEngine(this, compiler);
         }
     }
 
@@ -359,47 +371,20 @@ public class PoiTemplateEngine implements ExcelTemplateEngine {
     public void process(InputStream templateStream, Map<String, Object> data, OutputStream outputStream) {
         long startTime = System.currentTimeMillis();
         try {
-            ByteArrayOutputStream baos = new ByteArrayOutputStream();
-            byte[] buffer = new byte[8192];
-            int bytesRead;
-            while ((bytesRead = templateStream.read(buffer)) != -1) {
-                baos.write(buffer, 0, bytesRead);
-            }
-            byte[] templateBytes = baos.toByteArray();
+            // 1. 调用编译器获取分析和编译结果
+            AnalyzedTemplate analyzedTemplate = this.flexcelCompiler.compile(templateStream);
 
-            logger.info("Analysis Phase: Starting style and position mapping analysis...");
-            long analysisStart = System.currentTimeMillis();
-            Map<String, TemplateStyleInfo> allSheetsStyleInfo = new HashMap<>();
-            List<String> sheetOrder = new ArrayList<>();
-            try (Workbook analysisWorkbook = WorkbookFactory.create(new ByteArrayInputStream(templateBytes))) {
-                StyleMappingManager styleMappingManager = new StyleMappingManager();
-                for (Sheet sheet : analysisWorkbook) {
-                    sheetOrder.add(sheet.getSheetName());
-                    allSheetsStyleInfo.put(sheet.getSheetName(), styleMappingManager.extractTemplateStyles(sheet));
-                }
-            }
-            logger.info("Analysis Phase: Completed in {}ms", System.currentTimeMillis() - analysisStart);
+            // 从 analyzedTemplate 中获取所需数据
+            Map<String, TemplateStyleInfo> allSheetsStyleInfo = analyzedTemplate.getSheetStyles();
+            List<String> sheetOrder = analyzedTemplate.getSheetOrder();
+            Map<String, PrecompiledTemplate> compiledTemplates = analyzedTemplate.getCompiledSheets();
 
-            logger.info("Compilation Phase: Starting template pre-compilation...");
-            long compileStart = System.currentTimeMillis();
-            Map<String, PrecompiledTemplate> compiledTemplates = new HashMap<>();
-            try (Workbook compileWorkbook = WorkbookFactory.create(new ByteArrayInputStream(templateBytes))) {
-                // 将 styleInfo 传入编译器，以便其分派合并区域
-                TemplateCompiler compiler = new TemplateCompiler(this.cellTemplateFactory, this.blockDirectiveHandlers);
-                for (String sheetName : sheetOrder) {
-                    Sheet sheet = compileWorkbook.getSheet(sheetName);
-                    if (sheet != null) {
-                        compiledTemplates.put(sheetName, compiler.compile(sheet, allSheetsStyleInfo.get(sheetName)));
-                    }
-                }
-            }
-            logger.info("Compilation Phase: Completed in {}ms", System.currentTimeMillis() - compileStart);
-
+            // 2. 开始执行阶段
             Map<String, String> stringCache = new WeakHashMap<>();
-
             logger.info("Execution Phase: Starting single-producer-consumer model...");
             long generateStart = System.currentTimeMillis();
-            try (SXSSFWorkbook outputWorkbook = new SXSSFWorkbook(null, sxssfWindowSize, true, false)) {
+            try (Workbook outputWorkbook = this.streamingEnabled ?
+                    new SXSSFWorkbook(null, sxssfWindowSize, true, false) : new XSSFWorkbook()) {
                 Map<CellStyle, CellStyle> styleCache = new HashMap<>();
                 prepareStyles(outputWorkbook, allSheetsStyleInfo.values(), styleCache);
 
@@ -408,7 +393,12 @@ public class PoiTemplateEngine implements ExcelTemplateEngine {
                     PrecompiledTemplate compiledTemplate = compiledTemplates.get(sheetName);
                     if (compiledTemplate == null) continue;
 
-                    SXSSFSheet outputSheet = outputWorkbook.createSheet(sheetName);
+                    Sheet outputSheet;
+                    if (outputWorkbook instanceof SXSSFWorkbook) {
+                        outputSheet = ((SXSSFWorkbook) outputWorkbook).createSheet(sheetName);
+                    } else {
+                        outputSheet = outputWorkbook.createSheet(sheetName);
+                    }
                     TemplateContext baseContext = new TemplateContext(data, services, globalContext);
                     TemplateStyleInfo styleInfo = allSheetsStyleInfo.get(sheetName);
                     styleInfo.getAllColumnWidths().forEach(outputSheet::setColumnWidth);
@@ -427,7 +417,6 @@ public class PoiTemplateEngine implements ExcelTemplateEngine {
                     }
 
                     consumerFuture.get();
-                    // 此时 styleInfo 中的合并区域只剩下真正的静态区域了
                     applyStaticMergedRegions(outputSheet, styleInfo);
                 }
                 logger.info("Writing data to output stream...");
@@ -435,10 +424,12 @@ public class PoiTemplateEngine implements ExcelTemplateEngine {
             }
             logger.info("Execution Phase: Completed in {}ms", System.currentTimeMillis() - generateStart);
         } catch (Exception e) {
+            // 将 IOException 等异常包装成 RuntimeException，保持接口一致性
             throw new RuntimeException("Template processing failed", e);
         }
         logger.info("Template processing successful. Total time: {}ms", System.currentTimeMillis() - startTime);
     }
+
     private void executeTemplate(List<TemplateBlock> blocks, TemplateContext context,
                                  BlockingQueue<RenderedRow> queue, ObjectPool pool,
                                  AtomicInteger globalRowCounter, Map<String, String> stringCache) throws InterruptedException {
@@ -462,6 +453,8 @@ public class PoiTemplateEngine implements ExcelTemplateEngine {
                 // 2. 如果是 FOREACH 块
             } else if (block instanceof ForEachBlock) {
                 ForEachBlock feBlock = (ForEachBlock) block;
+                int loopStartRowNo = globalRowCounter.get() + 1;
+
 
                 // 求值集合表达式
                 Object itemsObject = this.expressionEvaluator.evaluate(feBlock.getCollectionExpression(), context.getAllData());
@@ -483,7 +476,11 @@ public class PoiTemplateEngine implements ExcelTemplateEngine {
                 } else {
                     logger.warn("Expression '{}' in #foreach is not iterable, skipping.", feBlock.getCollectionExpression());
                 }
-
+                int loopEndRowNo = globalRowCounter.get();
+                context.setVariable("startRowNo", loopStartRowNo);
+                context.setVariable("endRowNo", loopEndRowNo);
+                logger.debug("Set loop boundaries for collection '{}': startRowNo={}, endRowNo={}",
+                        feBlock.getCollectionExpression(), loopStartRowNo, loopEndRowNo);
                 // 3. 如果是静态行块 (递归的终点)
             } else if (block instanceof StaticRowsBlock) {
                 // 遍历所有静态行模板
@@ -501,7 +498,7 @@ public class PoiTemplateEngine implements ExcelTemplateEngine {
         }
     }
 
-    private Future<?> startConsumerThread(BlockingQueue<RenderedRow> queue, SXSSFSheet sheet, TemplateStyleInfo styleInfo,
+    private Future<?> startConsumerThread(BlockingQueue<RenderedRow> queue, Sheet sheet, TemplateStyleInfo styleInfo,
                                           Map<CellStyle, CellStyle> styleCache, ObjectPool pool) {
         ExecutorService consumerExecutor = Executors.newSingleThreadExecutor(r -> new Thread(r, "fastexcel-consumer"));
         Runnable consumerTask = () -> {
@@ -517,7 +514,7 @@ public class PoiTemplateEngine implements ExcelTemplateEngine {
         return future;
     }
 
-    private void consume(BlockingQueue<RenderedRow> queue, SXSSFSheet sheet, TemplateStyleInfo styleInfo,
+    private void consume(BlockingQueue<RenderedRow> queue, Sheet sheet, TemplateStyleInfo styleInfo,
                          Map<CellStyle, CellStyle> styleCache, ObjectPool pool) throws InterruptedException {
         Map<Integer, CellStyle[]> rowStyleCache = new HashMap<>();
         int currentRowIndex = 0;
@@ -572,7 +569,7 @@ public class PoiTemplateEngine implements ExcelTemplateEngine {
     }
 
     // handleMergeableCell, handleRegularCell, completePendingMerge, createAndSetCell, 等方法保持不变...
-    private void handleMergeableCell(SXSSFSheet sheet, Row outputRow, MergeableRenderedCell cellData, CellStyle style,
+    private void handleMergeableCell(Sheet sheet, Row outputRow, MergeableRenderedCell cellData, CellStyle style,
                                      int currentRowIndex, Map<Integer, Object> lastValuesForMerge, Map<Integer, Integer> mergeStartRows) {
         int colIdx = cellData.colIndex;
         Object currentValue = cellData.value;
@@ -595,7 +592,7 @@ public class PoiTemplateEngine implements ExcelTemplateEngine {
         lastValuesForMerge.put(colIdx, currentValue);
     }
 
-    private void handleRegularCell(SXSSFSheet sheet, Row outputRow, RenderedCell cellData, CellStyle style,
+    private void handleRegularCell(Sheet sheet, Row outputRow, RenderedCell cellData, CellStyle style,
                                    int currentRowIndex, Map<Integer, Object> lastValuesForMerge, Map<Integer, Integer> mergeStartRows) {
         int colIdx = cellData.colIndex;
         completePendingMerge(sheet, colIdx, currentRowIndex, mergeStartRows);
@@ -603,7 +600,7 @@ public class PoiTemplateEngine implements ExcelTemplateEngine {
         lastValuesForMerge.remove(colIdx);
     }
 
-    private void completePendingMerge(SXSSFSheet sheet, int colIdx, int currentRowIndex, Map<Integer, Integer> mergeStartRows) {
+    private void completePendingMerge(Sheet sheet, int colIdx, int currentRowIndex, Map<Integer, Integer> mergeStartRows) {
         if (mergeStartRows.containsKey(colIdx)) {
             int startRow = mergeStartRows.remove(colIdx);
             if (currentRowIndex - 1 > startRow) {
@@ -657,7 +654,7 @@ public class PoiTemplateEngine implements ExcelTemplateEngine {
      * @param rowData         当前渲染的行数据，其中包含模板合并信息。
      * @param currentRowIndex 当前写入的行索引。
      */
-    private void applyRowStaticMergedRegions(SXSSFSheet sheet, RenderedRow rowData, int currentRowIndex) {
+    private void applyRowStaticMergedRegions(Sheet sheet, RenderedRow rowData, int currentRowIndex) {
         List<CellRangeAddress> rowMerges = rowData.getStaticMergedRegions();
         if (rowMerges == null || rowMerges.isEmpty()) {
             return;
