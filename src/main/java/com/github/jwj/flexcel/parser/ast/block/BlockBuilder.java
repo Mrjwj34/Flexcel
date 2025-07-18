@@ -116,7 +116,7 @@ public class BlockBuilder {
         flushStaticRows();
         switch (type) {
             case FOREACH:
-                return new ForEachBlock(foreachItemName, foreachCollectionExpr, this.startRow, this.endRow, getChildrenAsRowTemplates());
+                return new ForEachBlock(foreachItemName, foreachCollectionExpr, this.children);
             case IF:
                 return new IfBlock(directive, (thenBranch != null) ? thenBranch : this.children, (thenBranch != null) ? this.children : new ArrayList<>());
             default:
@@ -127,12 +127,12 @@ public class BlockBuilder {
     /**
      * Extracts all RowTemplate objects from the child blocks.
      */
-    private List<RowTemplate> getChildrenAsRowTemplates() {
-        return this.children.stream()
-                .filter(b -> b instanceof StaticRowsBlock)
-                .flatMap(b -> ((StaticRowsBlock) b).getRowTemplates().stream())
-                .collect(Collectors.toList());
-    }
+//    private List<RowTemplate> getChildrenAsRowTemplates() {
+//        return this.children.stream()
+//                .filter(b -> b instanceof StaticRowsBlock)
+//                .flatMap(b -> ((StaticRowsBlock) b).getRowTemplates().stream())
+//                .collect(Collectors.toList());
+//    }
 
     /**
      * Compiles a raw POI Row into a RowTemplate object.

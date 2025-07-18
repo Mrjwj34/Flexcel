@@ -32,42 +32,19 @@ import java.util.List;
 public class ForEachBlock implements TemplateBlock {
     private final String itemName;
     private final String collectionExpression;
-    private final String indexName; // 通常是 "index"
-    private final int startRowNo;
-    private final int endRowNo;
-    private final List<RowTemplate> rowTemplates;
+    private final String indexName;
+    private final List<TemplateBlock> children; // <-- 关键修改：从 RowTemplate 变为 TemplateBlock
 
-    // 问题3：更新构造函数
-    public ForEachBlock(String itemName, String collectionExpression, int startRowNo, int endRowNo, List<RowTemplate> rowTemplates) {
+    public ForEachBlock(String itemName, String collectionExpression, List<TemplateBlock> children) {
         this.itemName = itemName;
         this.collectionExpression = collectionExpression;
         this.indexName = "index"; // 默认索引变量名
-        this.startRowNo = startRowNo;
-        this.endRowNo = endRowNo;
-        this.rowTemplates = rowTemplates;
+        this.children = children;
     }
 
-    public String getItemName() {
-        return itemName;
-    }
-
-    public String getCollectionExpression() {
-        return collectionExpression;
-    }
-
-    public String getIndexName() {
-        return indexName;
-    }
-
-    public int getStartRowNo() {
-        return startRowNo;
-    }
-
-    public int getEndRowNo() {
-        return endRowNo;
-    }
-
-    public List<RowTemplate> getRowTemplates() {
-        return rowTemplates;
-    }
+    // Getters
+    public String getItemName() { return itemName; }
+    public String getCollectionExpression() { return collectionExpression; }
+    public String getIndexName() { return indexName; }
+    public List<TemplateBlock> getChildren() { return children; } // <-- 新增 Getter
 }

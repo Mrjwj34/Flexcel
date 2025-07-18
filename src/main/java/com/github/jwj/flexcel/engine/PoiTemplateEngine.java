@@ -384,7 +384,7 @@ public class PoiTemplateEngine implements ExcelTemplateEngine {
             long compileStart = System.currentTimeMillis();
             Map<String, PrecompiledTemplate> compiledTemplates = new HashMap<>();
             try (Workbook compileWorkbook = WorkbookFactory.create(new ByteArrayInputStream(templateBytes))) {
-                // 【修复】将 styleInfo 传入编译器，以便其分派合并区域
+                // 将 styleInfo 传入编译器，以便其分派合并区域
                 TemplateCompiler compiler = new TemplateCompiler(this.cellTemplateFactory, this.blockDirectiveHandlers);
                 for (String sheetName : sheetOrder) {
                     Sheet sheet = compileWorkbook.getSheet(sheetName);
@@ -427,7 +427,7 @@ public class PoiTemplateEngine implements ExcelTemplateEngine {
                     }
 
                     consumerFuture.get();
-                    // 【修复】此时 styleInfo 中的合并区域只剩下真正的静态区域了
+                    // 此时 styleInfo 中的合并区域只剩下真正的静态区域了
                     applyStaticMergedRegions(outputSheet, styleInfo);
                 }
                 logger.info("Writing data to output stream...");
@@ -439,51 +439,63 @@ public class PoiTemplateEngine implements ExcelTemplateEngine {
         }
         logger.info("Template processing successful. Total time: {}ms", System.currentTimeMillis() - startTime);
     }
-
     private void executeTemplate(List<TemplateBlock> blocks, TemplateContext context,
                                  BlockingQueue<RenderedRow> queue, ObjectPool pool,
                                  AtomicInteger globalRowCounter, Map<String, String> stringCache) throws InterruptedException {
+
+        // 遍历当前层级的所有块
         for (TemplateBlock block : blocks) {
+
+            // 1. 如果是 IF 块
             if (block instanceof IfBlock) {
                 IfBlock ifBlock = (IfBlock) block;
-                if (ifBlock.evaluateCondition(context, this.expressionEvaluator)) {
-                    executeTemplate(ifBlock.getThenBlocks(), context, queue, pool, globalRowCounter, stringCache);
+                // 创建一个新的子作用域
+                TemplateContext ifContext = new TemplateContext(context);
+
+                // 判断条件，并递归执行相应的分支
+                if (ifBlock.evaluateCondition(ifContext, this.expressionEvaluator)) {
+                    executeTemplate(ifBlock.getThenBlocks(), ifContext, queue, pool, globalRowCounter, stringCache);
                 } else {
-                    executeTemplate(ifBlock.getElseBlocks(), context, queue, pool, globalRowCounter, stringCache);
+                    executeTemplate(ifBlock.getElseBlocks(), ifContext, queue, pool, globalRowCounter, stringCache);
                 }
+
+                // 2. 如果是 FOREACH 块
             } else if (block instanceof ForEachBlock) {
                 ForEachBlock feBlock = (ForEachBlock) block;
-                int loopStartRowNo = globalRowCounter.get() + 1;
 
+                // 求值集合表达式
                 Object itemsObject = this.expressionEvaluator.evaluate(feBlock.getCollectionExpression(), context.getAllData());
+
                 if (itemsObject instanceof Iterable) {
                     int index = 0;
+                    // 遍历集合
                     for (Object item : (Iterable<?>) itemsObject) {
+                        // 为每一次循环创建一个独立的子作用域，非常重要！
                         TemplateContext itemContext = new TemplateContext(context);
+                        // 在子作用域中设置循环变量
                         itemContext.setVariable(feBlock.getItemName(), item);
-                        itemContext.setVariable(feBlock.getIndexName(), index);
-                        itemContext.setVariable("currentRowNo", globalRowCounter.incrementAndGet());
-                        for (RowTemplate rt : feBlock.getRowTemplates()) {
-                            queue.put(rt.produce(itemContext, pool, stringCache, this.expressionEvaluator));
-                        }
-                        index++;
+                        itemContext.setVariable(feBlock.getIndexName(), index++);
+                        itemContext.setVariable("currentRowNo", globalRowCounter.get() + 1); // 如果需要 currentRowNo
+
+                        // 递归执行 for-each 块的子块
+                        executeTemplate(feBlock.getChildren(), itemContext, queue, pool, globalRowCounter, stringCache);
                     }
                 } else {
-                    logger.warn("Expression '{}' is not iterable, skipping.", feBlock.getCollectionExpression());
+                    logger.warn("Expression '{}' in #foreach is not iterable, skipping.", feBlock.getCollectionExpression());
                 }
 
-                int loopEndRowNo = globalRowCounter.get();
-                // 【修复】无论循环是否执行，都设置变量，以防后续表达式求值失败
-                context.setVariable("startRowNo", loopStartRowNo);
-                context.setVariable("endRowNo", loopEndRowNo);
-
+                // 3. 如果是静态行块 (递归的终点)
             } else if (block instanceof StaticRowsBlock) {
+                // 遍历所有静态行模板
                 for (RowTemplate rt : ((StaticRowsBlock) block).getRowTemplates()) {
-                    TemplateContext staticContext = new TemplateContext(context);
-                    staticContext.setVariable("currentRowNo", globalRowCounter.incrementAndGet());
-                    queue.put(rt.produce(staticContext, pool, stringCache, this.expressionEvaluator));
+                    // 注意：这里我们使用传入的 context，因为它已经包含了上层（如 for-each）设置的变量
+                    context.setVariable("currentRowNo", globalRowCounter.incrementAndGet()); // 更新行号
+                    queue.put(rt.produce(context, pool, stringCache, this.expressionEvaluator));
                 }
+
+                // 4. 如果是根块 (仅在开始时出现)
             } else if (block instanceof RootBlock) {
+                // 直接递归其子节点
                 executeTemplate(((RootBlock) block).getChildren(), context, queue, pool, globalRowCounter, stringCache);
             }
         }
